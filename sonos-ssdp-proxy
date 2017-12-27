@@ -1,0 +1,159 @@
+#!/usr/bin/env python2
+
+import netifaces, socket, struct, sys, threading, time
+from BaseHTTPServer import BaseHTTPRequestHandler
+from StringIO import StringIO
+
+class Sonos:
+    st = 'urn:schemas-upnp-org:device:ZonePlayer:1'
+    bc = ("239.255.255.250", 1900)
+    device_id = ''
+    verbose = False
+    shutting_down = False
+    players = {}
+
+    def __init__(self, device_id=None, verbose=False):
+        if (device_id):
+            self.device_id = device_id
+        self.verbose = verbose
+
+    def start(self, iface_sonos, ifaces):
+        thread_discover = threading.Thread(target=self.discover_periodic, args=[iface_sonos])
+        thread_discover.daemon = True
+        thread_discover.start()
+
+        for iface in ifaces:
+            thread_listen = threading.Thread(target=self.listen, args=[iface])
+            thread_listen.daemon = True
+            thread_listen.start()
+            time.sleep(1)
+        while True:
+            try:
+                time.sleep(1)
+            except:
+                sys.exit(0)
+
+    def discover_periodic(self, iface_sonos):
+        while(True):
+            self.discover(iface_sonos)
+            time.sleep(30)
+
+    def discover(self, iface, timeout=2):
+        """
+        Discovers all Sonos devices on a network, and populates `self.devices` with a dictionary containing the
+        device IPs and corresponding SSDP strings (as text).
+        """
+
+        # Build the request
+        headers = [
+            'M-SEARCH * HTTP/1.1',
+            'HOST: {}:{}'.format(*self.bc),
+            'MAN: "ssdp:discover"',
+            'MX: 1',
+            'ST: {}'.format(self.st),
+            'X-SONOS-DEVICEID: {}'.format(self.device_id),
+            'X-SONOS-SESSIONSECONDS: 0',
+            'X-SONOS-MDPMODEL: 3'
+        ]
+        message = "\r\n".join(headers + ['',''])
+        if self.verbose:
+            print("Starting new discovery request:\n{}".format(message))
+
+        # Build the socket
+        src_ip = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]['addr']
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        sock.bind((src_ip, self.bc[1]))
+
+        # Send the request
+        sock.sendto(message.encode(), self.bc)
+
+        # Process replies
+        players = {}
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+                players[addr[0]] = data
+                if (self.verbose):
+                    print("Discovered {}".format(addr[0]))
+            except socket.timeout:
+                break
+
+        self.players = players
+
+    def listen(self, iface):
+        """
+        Listens for SSDP requests on an interface, and replies to requests with Sonos devices as appropriate.
+        """
+        # Set up the socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Start listening
+        sock.bind(self.bc)
+
+        listen_ip = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]['addr']
+        listen_bcip = socket.inet_aton(self.bc[0]) + socket.inet_aton(listen_ip)
+        sock.setsockopt(socket.SOL_IP, socket.IP_MULTICAST_IF, socket.inet_aton(listen_ip))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, listen_bcip)
+
+        if self.verbose:
+            print("Listening on {} ({}) for {}:{}".format(iface, listen_ip, self.bc[0], self.bc[1]))
+
+        # Process incoming requests
+        while True:
+            try:
+                data, addr = sock.recvfrom(2048)
+                r = HTTPRequest(data)
+
+                if self.verbose and 'ST' in r.headers:
+                    print("ST {} from {} on {} ({})".format(r.headers['ST'], addr[0], iface, listen_ip))
+
+                if ('ST' in r.headers and r.headers['ST'] == self.st):
+                    if (self.verbose):
+                        print("Processing request from {}".format(addr[0]))
+                    self.reply(addr[0])
+            except (KeyboardInterrupt, SystemExit):
+                sys.exit(0)
+            except:
+                if self.verbose:
+                    raise
+
+            if self.shutting_down:
+                break
+
+    def reply(self, to_ip):
+        """
+        Replies to SSDP queries with all currently-known devices.
+        """
+        for ip, player in self.players.iteritems():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.sendto(player.encode(), (to_ip, self.bc[1]))
+
+class HTTPRequest(BaseHTTPRequestHandler):
+    def __init__(self, request_text):
+        self.rfile = StringIO(request_text)
+        self.raw_requestline = self.rfile.readline()
+        self.error_code = self.error_message = None
+        self.parse_request()
+
+    def send_error(self, code, message):
+        self.error_code = code
+        self.error_message = message
+
+if __name__ == "__main__":
+    # Arguments
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", help="Optionally, provide additional logging message", action='store_true', default=False)
+    parser.add_argument("--controller", help="Optionally, set a controller ID to use when querying players.", metavar="SSDP ID")
+    parser.add_argument("iface_sonos", help="The interface to use when querying sonos devices")
+    parser.add_argument("iface", nargs="+", help="The interface(s) to respond on.")
+    args = parser.parse_args()
+
+    # Start program
+    sonos = Sonos(device_id=args.controller, verbose=args.v)
+    sonos.start(args.iface_sonos, args.iface)
